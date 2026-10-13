@@ -12,7 +12,9 @@
 # Данные: суточная добыча 7 скважин основного фонда (5 добывающих, 2
 # нагнетательные; F-1 C переведена из добычи в нагнетание), 15 634 записи.
 #
-# Источник: Equinor Volve field data (публичный датасет).
+# Источник: Equinor Volve field data, Equinor Open Data Licence
+# (https://www.equinor.com/energy/volve-data-sharing). Правообладатели — Equinor ASA и бывшие
+# партнёры по лицензии Volve.
 
 # %% [markdown]
 # ## 1. Знакомство с данными
@@ -41,7 +43,7 @@ type_days = (df.groupby(["WELL", "WELL_TYPE"])["DATEPRD"]
 type_days
 
 # %%
-# F-1 C: когда произошёл перевод из добычи в нагачивание?
+# F-1 C: когда произошёл перевод из добычи в нагнетание?
 f1 = df[df["WELL"] == "F-1 C"].sort_values("DATEPRD")
 switch = f1.loc[f1["WELL_TYPE"].ne(f1["WELL_TYPE"].shift()), ["DATEPRD", "WELL_TYPE"]]
 switch
@@ -193,55 +195,111 @@ print(f"медианная компенсация: {vrr.median():.2f}")
 # %% [markdown]
 # ## 8. Статистическая проверка гипотез
 #
-# ### H1. Влияние длительных остановок на дебит (эффект перезапуска)
+# ### H1. Падает ли дебит после остановки скважины (эффект перезапуска)
 #
-# Утверждение из практики: после длительной остановки дебит нефти
-# восстанавливается не сразу (или наоборот — кратковременно выше за счёт
-# подпитки). Проверяем парным тестом Уилкоксона: средний дебит за 10 дней до
-# остановки ≥ 7 дней против 10 дней после.
+# Утверждение из практики: после остановки дебит нефти восстанавливается не сразу.
+# Наивная проверка — сравнить средний дебит за 10 дней до остановки и 10 дней после.
+# Но у Volve дебит падает и без остановок (decline ~40 %/год, раздел H3): за три недели
+# между окнами «до» и «после» он снизился бы в любом случае. Поэтому три шага:
+#
+# 1. **наивное «до/после»** — как обычно делают;
+# 2. **плацебо** — тот же расчёт в случайные дни без остановок: сколько «эффекта» даёт само падение;
+# 3. **поправка на тренд** — прогноз дебита по тренду за 60 дней до остановки против факта после.
+#
+# Эпизоды одной скважины не независимы, а скважин всего пять, поэтому интервал —
+# **бутстреп по скважинам** (кластерный), а не по эпизодам.
 
 # %%
-pairs = []
-p_h1 = np.nan
-for w, g in d[(d["WELL_TYPE"] == "OP")].groupby("WELL"):
-    g = g.set_index("DATEPRD").sort_index()["BORE_OIL_VOL"]
-    # эпизоды остановок: схлопываем подряд идущие дни в одно событие
-    shut_days = df[(df["WELL"] == w) & df["shutdown"]]["DATEPRD"].sort_values()
-    if shut_days.empty:
-        continue
-    episodes, cur = [], [shut_days.iloc[0]]
-    for t in shut_days.iloc[1:]:
-        if (t - cur[-1]).days <= 1:
+def shut_episodes(w):
+    """Эпизоды остановок скважины: подряд идущие дни с нулевой наработкой."""
+    days = df[(df["WELL"] == w) & df["shutdown"]]["DATEPRD"].sort_values()
+    eps, cur = [], []
+    for t in days:
+        if cur and (t - cur[-1]).days <= 1:
             cur.append(t)
         else:
-            episodes.append(cur)
+            if cur:
+                eps.append((cur[0], cur[-1]))
             cur = [t]
-    episodes.append(cur)
-    for ep in episodes:
-        t0, t1 = ep[0], ep[-1]
-        pre = g.loc[t0 - pd.Timedelta(days=10):t0 - pd.Timedelta(days=1)]
-        post = g.loc[t1 + pd.Timedelta(days=1):t1 + pd.Timedelta(days=10)]
-        if len(pre) >= 7 and len(post) >= 7:
-            pairs.append((w, pre.mean(), post.mean()))
-res = pd.DataFrame(pairs, columns=["WELL", "до", "после"])
-res["Δ, м³/сут"] = (res["после"] - res["до"]).round(0)
-if len(res) >= 10:
-    stat_h1, p_h1 = stats.wilcoxon(res["до"], res["после"])
-print(f"эпизодов остановок: {len(res)}, медиана Δ = {res['Δ, м³/сут'].median():.0f} м³/сут, "
-      f"Wilcoxon p = {p_h1:.2e}")
+    if cur:
+        eps.append((cur[0], cur[-1]))
+    return eps
+
+
+def before_after(q, t0, t1):
+    """Средний дебит за 10 дней до t0 и после t1 + прогноз по лог-тренду за 60 дней до t0."""
+    pre = q.loc[t0 - pd.Timedelta(days=10):t0 - pd.Timedelta(days=1)]
+    post = q.loc[t1 + pd.Timedelta(days=1):t1 + pd.Timedelta(days=10)]
+    hist = q.loc[t0 - pd.Timedelta(days=60):t0 - pd.Timedelta(days=1)]
+    hist = hist[hist > 0]
+    if len(pre) < 7 or len(post) < 7 or len(hist) < 20 or pre.mean() <= 0:
+        return None
+    b = np.polyfit((hist.index - t0).days.values, np.log(hist.values), 1)
+    pred = np.exp(np.polyval(b, (t1 - t0).days + 5.5))      # середина окна «после»
+    return pre.mean(), post.mean(), pred
+
+
+rows = []
+for w, g in d[d["WELL_TYPE"] == "OP"].groupby("WELL"):
+    q = g.set_index("DATEPRD").sort_index()["BORE_OIL_VOL"]
+    shut = set(df[(df["WELL"] == w) & df["shutdown"]]["DATEPRD"])
+    for t0, t1 in shut_episodes(w):
+        r = before_after(q, t0, t1)
+        if r:
+            rows.append((w, "остановка", *r))
+    # плацебо: рабочие дни, в ±12 дней от которых остановок не было
+    ok_days = [t for t in q.index[q.values > 0]
+               if not any(t + pd.Timedelta(days=k) in shut for k in range(-12, 13))]
+    picked = RNG.choice(len(ok_days), min(len(ok_days), 300), replace=False)
+    for i in sorted(picked):
+        r = before_after(q, ok_days[i], ok_days[i])
+        if r:
+            rows.append((w, "плацебо", *r))
+ep = pd.DataFrame(rows, columns=["WELL", "тип", "до", "после", "прогноз"])
+ep = ep[ep["WELL"].isin(ep.loc[ep["тип"] == "остановка", "WELL"])]   # скважины, где были остановки
+ep["наивно, %"] = np.log(ep["после"].clip(lower=1) / ep["до"].clip(lower=1)) * 100
+ep["к тренду, %"] = np.log(ep["после"].clip(lower=1) / ep["прогноз"]) * 100
+real = ep[ep["тип"] == "остановка"]
+stat_h1, p_h1 = stats.wilcoxon(real["до"], real["после"])
+print(f"эпизодов остановок: {len(real)}, плацебо-окон: {(ep['тип'] == 'плацебо').sum()}; "
+      f"наивный Wilcoxon p = {p_h1:.3f}")
+ep.groupby("тип")[["наивно, %", "к тренду, %"]].median().round(1)
 
 # %%
-ax = res.boxplot(column=["до", "после"], showmeans=True)
-ax.set_title("Среднесуточный дебит нефти до/после остановок (10-дневные окна)")
-ax.set_ylabel("м³/сут")
-plt.show()
-res.groupby("WELL")["Δ, м³/сут"].mean().round(0).rename("среднее Δ, м³/сут")
+# Эффект = (остановки − плацебо) по поправленному на тренд дебиту; бутстреп по скважинам.
+# Медианы, а не средние: если скважину вскоре снова остановили, дебит в окне «после» близок
+# к нулю, и одно такое окно уводит среднее логарифма на десятки процентов.
+def h1_effect(sample):
+    m = sample.groupby("тип")["к тренду, %"].median()
+    return m.get("остановка", np.nan) - m.get("плацебо", np.nan)
+
+
+wells_op = ep["WELL"].unique()
+boot = [h1_effect(pd.concat([ep[ep["WELL"] == w] for w in RNG.choice(wells_op, len(wells_op))]))
+        for _ in range(2000)]
+h1_est = h1_effect(ep)
+h1_lo, h1_hi = np.nanpercentile(boot, [2.5, 97.5])
+by_well = ep.pivot_table(index="WELL", columns="тип", values="к тренду, %", aggfunc="median")
+by_well["эффект"] = by_well["остановка"] - by_well["плацебо"]
+by_well["эпизодов"] = real.groupby("WELL").size()
+print(f"эффект остановки к тренду: {h1_est:+.1f} %, 95 % ДИ (бутстреп по скважинам) "
+      f"[{h1_lo:+.1f}; {h1_hi:+.1f}] %")
+by_well.round(1)
 
 # %% [markdown]
-# ### H2. Связь закачки с отбором воды и нефти (месячная шкала, лаг)
+# **Итог H1.** Наивное «до/после» (медиана −8 %) примерно вдвое завышает эффект: плацебо-окна
+# без всяких остановок дают −2 % — это естественное падение добычи. С поправкой на тренд
+# остаётся около −4 % с интервалом от −15 % почти до нуля, и держится он на F-1 C — скважине
+# на исходе добычи, которую затем перевели под закачку. У F-12 H и F-14 H, дающих 85 % нефти,
+# эффект около нуля, у F-15 D — обратный. Пять скважин — мало для бутстрепа по скважинам, так что
+# интервал ориентировочный. **Вывод: остановка бьёт по слабым скважинам на поздней стадии,
+# а для основного фонда заметного эффекта перезапуска нет.**
+
+# %% [markdown]
+# ### H2. Связь закачки с отбором (месячная шкала)
 #
-# Сканируем лаги 0–6 месяцев: Spearman-корреляция закачки с добычей воды и
-# нефти; 95 % ДИ для лучшего лага — бутстрепом.
+# Сначала — как обычно: Spearman-корреляция месячных объёмов закачки с добычей воды и нефти
+# на лагах 0–6 месяцев.
 
 # %%
 lag_scan = []
@@ -252,60 +310,113 @@ for lag in range(0, 7):
         r, p = stats.spearmanr(wi[ok], target[ok])
         lag_scan.append((lag, name, r, p))
 lag_tb = pd.DataFrame(lag_scan, columns=["лаг, мес", "целевая", "Spearman ρ", "p"])
-lag_tb.round({"Spearman ρ": 2, "p": 4})
+lag_tb.pivot(index="лаг, мес", columns="целевая", values="Spearman ρ").round(2)
+
+# %% [markdown]
+# Сильнее всего связь без лага, и с **нефтью** она сильнее, чем с водой. Для «отклика на
+# заводнение» это подозрительно, поэтому две проверки:
+#
+# * **интервал.** Месячный ряд автокоррелирован, обычный бутстреп по месяцам делает интервал
+#   слишком узким — нужен блочный бутстреп (блоки по 6 месяцев);
+# * **общая причина.** Когда платформа стоит, падают и закачка, и добыча. Если связь держится
+#   на времени работы, то в дебитах на час работы она должна исчезнуть.
 
 # %%
-best = lag_tb.loc[lag_tb.query("целевая=='вода'")["Spearman ρ"].idxmax()]
-wi = fm["BORE_WI_VOL"].shift(int(best["лаг, мес"])); wat = fm["BORE_WAT_VOL"]
-ok = wi.notna() & wat.notna()
-wi_v, wat_v = wi[ok].values, wat[ok].values
-# бутстреп по парам: индексы сэмплируем совместно, парность сохраняется
-n = len(wi_v)
-boot = []
-for _ in range(2000):
-    idx = RNG.integers(0, n, n)
-    boot.append(stats.spearmanr(wi_v[idx], wat_v[idx]).statistic
-                if hasattr(stats.spearmanr(wi_v[idx], wat_v[idx]), "statistic")
-                else stats.spearmanr(wi_v[idx], wat_v[idx])[0])
-lo, hi = np.percentile(boot, [2.5, 97.5])
-rho_lo, rho_hi = lo, hi
-print(f"вода, лаг {best['лаг, мес']:.0f} мес: ρ={best['Spearman ρ']:.2f}, "
-      f"95% ДИ [{lo:.2f}; {hi:.2f}]")
+def block_boot(x, y, stat, n_boot=2000, block=6):
+    n, out = len(x), []
+    for _ in range(n_boot):
+        starts = RNG.integers(0, n - block + 1, int(np.ceil(n / block)))
+        idx = np.concatenate([np.arange(s, s + block) for s in starts])[:n]
+        out.append(stat(x[idx], y[idx]))
+    return np.percentile(out, [2.5, 97.5])
+
+
+def spear(a, b):
+    return stats.spearmanr(a, b)[0]
+
+
+x, y = fm["BORE_WI_VOL"].values, fm["BORE_WAT_VOL"].values
+rho_wat = spear(x, y)
+iid = [spear(x[i], y[i]) for i in (RNG.integers(0, len(x), len(x)) for _ in range(2000))]
+iid_lo, iid_hi = np.percentile(iid, [2.5, 97.5])
+rho_lo, rho_hi = block_boot(x, y, spear)
+
+# время работы: часы добывающих и нагнетательных скважин за месяц
+hrs = (d.pivot_table(index=pd.Grouper(key="DATEPRD", freq="MS"), columns="WELL_TYPE",
+                     values="ON_STREAM_HRS", aggfunc="sum").reindex(fm.index).fillna(0))
+rate = pd.DataFrame({"закачка/ч": fm["BORE_WI_VOL"] / hrs["WI"].replace(0, np.nan),
+                     "вода/ч": fm["BORE_WAT_VOL"] / hrs["OP"].replace(0, np.nan),
+                     "нефть/ч": fm["BORE_OIL_VOL"] / hrs["OP"].replace(0, np.nan)}).diff().dropna()
+vol = fm.diff().dropna()
+rho_rate = spear(rate["закачка/ч"], rate["вода/ч"])
+h2 = pd.DataFrame({
+    "что коррелируем (изменение месяц к месяцу)": [
+        "часы работы: добыча ~ закачка", "объёмы: закачка ~ вода", "объёмы: закачка ~ нефть",
+        "дебит на час: закачка ~ вода", "дебит на час: закачка ~ нефть"],
+    "Spearman ρ": [
+        spear(hrs["OP"].diff().dropna(), hrs["WI"].diff().dropna()),
+        spear(vol["BORE_WI_VOL"], vol["BORE_WAT_VOL"]), spear(vol["BORE_WI_VOL"], vol["BORE_OIL_VOL"]),
+        rho_rate, spear(rate["закачка/ч"], rate["нефть/ч"])]})
+print(f"уровни, лаг 0: ρ = {rho_wat:.2f}; 95 % ДИ: обычный бутстреп [{iid_lo:.2f}; {iid_hi:.2f}], "
+      f"блочный [{rho_lo:.2f}; {rho_hi:.2f}]")
+h2.round(2)
+
+# %% [markdown]
+# **Итог H2.** Корреляция месячных объёмов почти целиком объясняется временем работы платформы:
+# часы добывающих и нагнетательных скважин меняются синхронно, а в дебитах на час работы связь
+# закачки с водой и нефтью почти исчезает. Блочный бутстреп к тому же расширяет интервал для
+# уровней до нуля. **Отклик добычи на заводнение по месячным суммам месторождения не виден** —
+# для этого нужен анализ пар «нагнетательная — добывающая» (например, ёмкостно-резистивная
+# модель, CRM) на суточных данных.
 
 # %% [markdown]
 # ### H3. Темп падения добычи (экспоненциальный decline)
 #
-# Для крупнейшей скважины F-12 H на стационарном участке (после года работы)
-# оцениваем экспоненциальный спад: ln(q) = a + b·t. Даём ДИ наклона,
-# номинальный темп падения D и проверку качества аппроксимации.
+# Для крупнейшей скважины F-12 H на участке после первого года работы оцениваем
+# экспоненциальный спад: ln(q) = a + b·t. Остатки месячного ряда автокоррелированы, поэтому
+# интервал наклона — с поправкой Ньюи — Уэста (HAC), а не обычный МНК.
 
 # %%
+import statsmodels.api as sm
+from statsmodels.stats.stattools import durbin_watson
+
 g12 = (d[(d["WELL"] == "F-12 H") & (d["qliq"] > 0)]
        .set_index("DATEPRD").resample("MS")["BORE_OIL_VOL"].mean())
 g12s = g12[(g12 > 0) & (g12.index >= g12.index[0] + pd.DateOffset(years=1))]
-t = (g12s.index - g12s.index[0]).days / 365.25
-reg = stats.linregress(t, np.log(g12s.values))
-D = -reg.slope
-tcrit = stats.t.ppf(0.975, len(t) - 2)
-lo, hi = -(reg.slope + tcrit * reg.stderr), -(reg.slope - tcrit * reg.stderr)
+t = np.asarray((g12s.index - g12s.index[0]).days / 365.25)
+X = sm.add_constant(t)
+ols = sm.OLS(np.log(g12s.values), X).fit()
+hac = sm.OLS(np.log(g12s.values), X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
+D = -ols.params[1]
+lo_ols, hi_ols = -ols.conf_int()[1][::-1]
+lo, hi = -hac.conf_int()[1][::-1]
+D_eff = 1 - np.exp(-D)
+dw = durbin_watson(ols.resid)
 fig, ax = plt.subplots()
 ax.plot(g12s.index, g12s.values, label="месячный дебит F-12 H")
-ax.plot(g12s.index, np.exp(reg.intercept + reg.slope * t), "--", color="#fa7a33",
-        label=f"эксп. тренд: D = {D:.1%}/год")
+ax.plot(g12s.index, np.exp(ols.params[0] - D * t), "--", color="#fa7a33",
+        label=f"эксп. тренд: −{D_eff:.0%} за год")
 ax.set_yscale("log")
 ax.set_ylabel("м³/сут (лог)")
-ax.set_title(f"Экспоненциальный decline F-12 H: R² = {reg.rvalue**2:.2f}")
+ax.set_title(f"Экспоненциальный decline F-12 H: R² = {ols.rsquared:.2f}")
 ax.legend()
 plt.show()
-print(f"D = {D:.1%}/год, 95% ДИ [{lo:.1%}; {hi:.1%}], p наклона = {reg.pvalue:.1e}")
+print(f"номинальный темп D = {D:.1%}/год → дебит за год падает на {D_eff:.0%}; "
+      f"95 % ДИ D: МНК [{lo_ols:.1%}; {hi_ols:.1%}], HAC [{lo:.1%}; {hi:.1%}]; "
+      f"Durbin — Watson = {dw:.2f}")
+
+# %% [markdown]
+# **Итог H3.** Durbin — Watson далёк от 2 — остатки сильно автокоррелированы, и обычный МНК
+# занижает интервал примерно вдвое. Номинальный темп D ≈ 42 %/год означает падение дебита
+# примерно на треть за год; для планирования отборов это нулевой прогноз с честным интервалом.
 
 # %% [markdown]
 # ## 9. Выводы для разработки
 
 # %%
 conclusions = [
-    f"Фонд: 5 добывающих + 2 нагнетательные скважины; F-1 C переведена из "
-    f"добычи в закачку — единственный кейс смены роли.",
+    "Фонд: 5 добывающих + 2 нагнетательные скважины; F-1 C переведена из "
+    "добычи в закачку — единственный кейс смены роли.",
     f"Данные грязные ровно настолько, насколько ожидаемо: пропуски датчиков "
     f"до {miss.max():.0f}% колонок, остановки до "
     f"{sh['доля, %'].max():.0f}% дней по скважинам; дубликатов и отрицательных "
@@ -313,15 +424,15 @@ conclusions = [
     f"Добычу делают две скважины: F-12 H и F-14 H дают "
     f"{(wells.loc[['F-12 H', 'F-14 H'], 'нефть_млн'].sum() / wells['нефть_млн'].sum()):.0%} "
     f"всей нефти — высокая концентрация фонда.",
-    f"Заводнение: медианная компенсация {vrr.median():.2f}; связь закачки с "
-    f"добычей воды умеренная (ρ={best['Spearman ρ']:.2f}, 95% ДИ "
-    f"[{rho_lo:.2f}; {rho_hi:.2f}] при лаге {best['лаг, мес']:.0f} мес), с нефтью "
-    f"заметно слабее — режим поддерживающий.",
-    f"Перезапуски обходятся дороже, чем приносят: эпизодов {len(res)}, после "
-    f"остановок дебит нефти в среднем ниже на {-res['Δ, м³/сут'].median():.0f} м³/сут "
-    f"(Wilcoxon p = {p_h1:.2f} — на границе значимости).",
-    f"Decline флагмана F-12 H: D = {D:.1%}/год (R² = {reg.rvalue**2:.2f}) — "
-    f"хороший нулевой прогноз для планирования отборов.",
+    f"Остановки: наивное «до/после» примерно вдвое завышает эффект — часть падения естественная "
+    f"(плацебо). С поправкой на тренд эффект {h1_est:+.1f} %, 95 % ДИ по скважинам "
+    f"[{h1_lo:+.1f}; {h1_hi:+.1f}] %; держится он на F-1 C, а у F-12 H и F-14 H (85 % нефти) "
+    f"эффект около нуля. Остановки опасны для слабых скважин на поздней стадии, не для основного фонда.",
+    f"Заводнение: медианная компенсация {vrr.median():.2f}. Корреляция месячных объёмов закачки "
+    f"и воды (ρ = {rho_wat:.2f}) объясняется общим временем работы платформы: в дебитах на час "
+    f"работы ρ = {rho_rate:.2f}. Отклик на закачку нужно искать по парам скважин на суточных данных.",
+    f"Decline флагмана F-12 H: D = {D:.0%}/год номинально (−{D_eff:.0%} дебита за год), "
+    f"95 % ДИ с учётом автокорреляции [{lo:.0%}; {hi:.0%}] — нулевой прогноз для планирования отборов.",
 ]
 for i, c in enumerate(conclusions, 1):
     print(f"{i}. {c}")
